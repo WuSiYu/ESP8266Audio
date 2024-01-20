@@ -1,7 +1,7 @@
 /*
   AudioFileSourceICYStream
   Streaming Shoutcast ICY source
-  
+
   Copyright (C) 2017  Earle F. Philhower, III
 
   This program is free software: you can redistribute it and/or modify
@@ -20,10 +20,9 @@
 
 #if defined(ESP32) || defined(ESP8266)
 
-#ifdef _GNU_SOURCE
-#undef _GNU_SOURCE
-#endif
+#if !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
+#endif
 
 #include "AudioFileSourceICYStream.h"
 #include <string.h>
@@ -44,11 +43,12 @@ AudioFileSourceICYStream::AudioFileSourceICYStream(const char *url)
 
 bool AudioFileSourceICYStream::open(const char *url)
 {
-  static const char *hdr[] = { "icy-metaint", "icy-name", "icy-genre", "icy-br" };
+  static const char *hdr[] = { "icy-metaint", "icy-name", "icy-genre", "icy-br", "Transfer-Encoding" };
   pos = 0;
-  http.begin(client, url);
+  _setup_client(url);
+  http.begin(*_client, url);
   http.addHeader("Icy-MetaData", "1");
-  http.collectHeaders( hdr, 4 );
+  http.collectHeaders( hdr, 5 );
   http.setReuse(true);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   int code = http.GET();
@@ -75,8 +75,32 @@ bool AudioFileSourceICYStream::open(const char *url)
     String ret = http.header(hdr[3]);
 //    cb.md("Bitrate", false, ret.c_str());
   }
+  if (http.hasHeader(hdr[4])) {
+    audioLogger->printf_P(PSTR("Transfer-Encoding: %s\n"), http.header("Transfer-Encoding").c_str());
+    if(http.header("Transfer-Encoding") == String(PSTR("chunked"))) {
+
+      next_chunk = getChunkSize();
+      if(-1 == next_chunk)
+      {
+        return false;
+      }
+      is_chunked = true;
+      readImpl = &AudioFileSourceHTTPStream::readChunked;
+    } else {
+      is_chunked = false;
+      readImpl = &AudioFileSourceHTTPStream::readRegular;
+    }
+
+  } else {
+    readImpl = &AudioFileSourceHTTPStream::readRegular;
+    audioLogger->printf_P(PSTR("No Transfer-Encoding\n"));
+    is_chunked = false;
+  }
 
   icyByteCount = 0;
+  mdSize = 0;
+  readingIcy = false;
+  memset(icyBuff, 0, sizeof(icyBuff));
   size = http.getSize();
   strncpy(saveURL, url, sizeof(saveURL));
   saveURL[sizeof(saveURL)-1] = 0;
@@ -88,138 +112,110 @@ AudioFileSourceICYStream::~AudioFileSourceICYStream()
   http.end();
 }
 
-uint32_t AudioFileSourceICYStream::readInternal(void *data, uint32_t len, bool nonBlock)
+uint32_t AudioFileSourceICYStream::read(void *data, uint32_t len)
 {
-  // Ensure we can't possibly read 2 ICY headers in a single go #355
-  if (icyMetaInt > 1) {
-    len = std::min((int)(icyMetaInt >> 1), (int)len);
-  }
-retry:
-  if (!http.connected()) {
-    cb.st(STATUS_DISCONNECTED, PSTR("Stream disconnected"));
-    http.end();
-    for (int i = 0; i < reconnectTries; i++) {
-      char buff[64];
-      sprintf_P(buff, PSTR("Attempting to reconnect, try %d"), i);
-      cb.st(STATUS_RECONNECTING, buff);
-      delay(reconnectDelayMs);
-      if (open(saveURL)) {
-        cb.st(STATUS_RECONNECTED, PSTR("Stream reconnected"));
-        break;
-      }
-    }
-    if (!http.connected()) {
-      cb.st(STATUS_DISCONNECTED, PSTR("Unable to reconnect"));
-      return 0;
-    }
-  }
-  if ((size > 0) && (pos >= size)) return 0;
-
-  WiFiClient *stream = http.getStreamPtr();
-
-  // Can't read past EOF...
-  if ( (size > 0) && (len > (uint32_t)(pos - size)) ) len = pos - size;
-
-  if (!nonBlock) {
-    int start = millis();
-    while ((stream->available() < (int)len) && (millis() - start < 500)) yield();
+  if (data==NULL) {
+    audioLogger->printf_P(PSTR("ERROR! AudioFileSourceHTTPStream::read passed NULL data\n"));
+    return 0;
   }
 
-  size_t avail = stream->available();
-  if (!nonBlock && !avail) {
-    cb.st(STATUS_NODATA, PSTR("No stream data available"));
-    http.end();
-    goto retry;
+  uint32_t readLen = 0;
+  uint32_t toRead = len;
+  unsigned long start = millis();
+  while ((readLen < len) && (((signed long)(millis() - start)) < 1500)){
+    if (!isOpen()) break;
+    uint32_t ret = readWithIcy((void*)(((uint8_t*)data) + readLen), toRead, true);
+    readLen += ret;
+    toRead -= ret;
   }
-  if (avail == 0) return 0;
-  if (avail < len) len = avail;
 
+  return readLen;
+}
+
+uint32_t AudioFileSourceICYStream::readNonBlock(void *data, uint32_t len)
+{
+  if (data==NULL) {
+    audioLogger->printf_P(PSTR("ERROR! AudioFileSourceHTTPStream::readNonBlock passed NULL data\n"));
+    return 0;
+  }
+
+  uint32_t readLen = readWithIcy(data, len, true);
+
+  return readLen;
+}
+
+uint32_t AudioFileSourceICYStream::readWithIcy(void *data, uint32_t len, bool nonBlock){
   int read = 0;
   int ret = 0;
-  // If the read would hit an ICY block, split it up...
-  if (((int)(icyByteCount + len) > (int)icyMetaInt) && (icyMetaInt > 0)) {
-    int beforeIcy = icyMetaInt - icyByteCount;
+
+  if (readingIcy){
+    if (mdSize>0){
+      uint32_t readMdLen = std::min((int)(mdSize), (int)len);
+      readMdLen = std::min((int)(readMdLen), (int)256); //the buffer is only 256 big
+      ret = (this->*readImpl)(data, readMdLen, nonBlock);
+      if (ret < 0) ret = 0;
+      len -= ret;
+      mdSize -= ret;
+
+      if (ret > 0){
+        char *readInto = icyBuff + 256;
+        memcpy(readInto, data, ret);
+        int end = 256 + ret; // The last byte of valid data
+        char *header = (char *)memmem((void*)icyBuff, end, (void*)"StreamTitle=", 12);
+        if (header) {
+          char *p = header+12;
+          if (*p=='\'' || *p== '"' ) {
+            char closing[] = { *p, ';', '\0' };
+            char *psz = strstr( p+1, closing );
+            if( !psz ) psz = strchr( p+1, ';' );
+            if( psz ) *psz = '\0';
+            p++;
+          } else {
+            char *psz = strchr( p, ';' );
+            if( psz ) *psz = '\0';
+          }
+          cb.md("StreamTitle", false, p);
+        }
+        memmove(icyBuff, icyBuff+ret, 256);
+
+      }
+      if (ret != readMdLen) return read; // Partial read
+    }
+    if (mdSize<=0){
+      icyByteCount = 0;
+      mdSize = 0;
+      readingIcy = false;
+    }
+  }else{
+    int beforeIcy;
+    if (((int)(icyByteCount + len) >= (int)icyMetaInt) && (icyMetaInt > 0)) {
+      beforeIcy = icyMetaInt - icyByteCount;
+    }else{
+      beforeIcy = len;
+    }
     if (beforeIcy > 0) {
-      ret = stream->read(reinterpret_cast<uint8_t*>(data), beforeIcy);
+      ret = (this->*readImpl)(data, beforeIcy, nonBlock);
       if (ret < 0) ret = 0;
       read += ret;
-      pos += ret;
       len -= ret;
       data = (void *)(reinterpret_cast<char*>(data) + ret);
       icyByteCount += ret;
       if (ret != beforeIcy) return read; // Partial read
     }
-
-    // ICY MD handling
-    int mdSize;
-    uint8_t c;
-    int mdret = stream->read(&c, 1);
-    if (mdret==0) return read;
-    mdSize = c * 16;
-    if ((mdret == 1) && (mdSize > 0)) {
-      // This is going to get ugly fast.
-      char icyBuff[256 + 16 + 1];
-      char *readInto = icyBuff + 16;
-      memset(icyBuff, 0, 16); // Ensure no residual matches occur
-      while (mdSize) {
-        int toRead = mdSize > 256 ? 256 : mdSize;
-        int ret = stream->read((uint8_t*)readInto, toRead);
-        if (ret < 0) return read;
-        if (ret == 0) { delay(1); continue; }
-        mdSize -= ret;
-        // At this point we have 0...15 = last 15 chars read from prior read plus new data
-        int end = 16 + ret; // The last byte of valid data
-        char *header = (char *)memmem((void*)icyBuff, end, (void*)"StreamTitle=", 12);
-        if (!header) {
-          // No match, so move the last 16 bytes back to the start and continue
-          memmove(icyBuff, icyBuff+end-16, 16);
-          delay(1);
-	  continue;
-        }
-        // Found header, now move it to the front
-        int lastValidByte = end - (header -icyBuff) + 1;
-        memmove(icyBuff, header, lastValidByte);
-        // Now fill the buffer to the end with read data
-        while (mdSize && lastValidByte < 255) {
-          int toRead = mdSize > (256 - lastValidByte) ? (256 - lastValidByte) : mdSize;
-          ret = stream->read((uint8_t*)icyBuff + lastValidByte, toRead);
-          if (ret==-1) return read; // error
-          if (ret == 0) { delay(1); continue; }
-          mdSize -= ret;
-          lastValidByte += ret;
-        }
-        // Buffer now contains StreamTitle=....., parse it
-        char *p = icyBuff+12;
-        if (*p=='\'' || *p== '"' ) {
-          char closing[] = { *p, ';', '\0' };
-          char *psz = strstr( p+1, closing );
-          if( !psz ) psz = strchr( &icyBuff[13], ';' );
-          if( psz ) *psz = '\0';
-          p++;
-        } else {
-          char *psz = strchr( p, ';' );
-          if( psz ) *psz = '\0';
-        }
-        cb.md("StreamTitle", false, p);
-
-        // Now skip rest of MD block
-        while (mdSize) {
-          int toRead = mdSize > 256 ? 256 : mdSize;
-          ret = stream->read((uint8_t*)icyBuff, toRead);
-          if (ret < 0) return read;
-          if (ret == 0) { delay(1); continue; }
-          mdSize -= ret;
-        }
+    if (len >= 1 ){  //try to read mdSize
+      ret = (this->*readImpl)(data, 1, nonBlock);
+      if (ret < 0) ret = 0;
+      if (ret==1){
+        mdSize = *((uint8_t*)data) * 16;
+        readingIcy = true;
+        memset(icyBuff, 0, 256); // Ensure no residual matches occur
       }
+      len -= ret;
+      data = (void *)(reinterpret_cast<char*>(data) + ret);
+      if (ret != 1) return read; // Partial read
     }
-    icyByteCount = 0;
   }
 
-  ret = stream->read(reinterpret_cast<uint8_t*>(data), len);
-  if (ret < 0) ret = 0;
-  read += ret;
-  pos += ret;
-  icyByteCount += ret;
   return read;
 }
 

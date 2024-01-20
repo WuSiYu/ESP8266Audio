@@ -38,11 +38,17 @@ class AudioFileSourceICYStream : public AudioFileSourceHTTPStream
     virtual ~AudioFileSourceICYStream() override;
     
     virtual bool open(const char *url) override;
+    virtual uint32_t read(void *data, uint32_t len) override;
+    virtual uint32_t readNonBlock(void *data, uint32_t len) override;
+    
 
   private:
-    virtual uint32_t readInternal(void *data, uint32_t len, bool nonBlock) override;
+    uint32_t readWithIcy(void *data, uint32_t len, bool nonBlock);
     int icyMetaInt;
     int icyByteCount;
+    int mdSize;
+    bool readingIcy;
+    char icyBuff[256 + 256 + 1];  //256 for new data, 256 for old data
 };
 
 #endif

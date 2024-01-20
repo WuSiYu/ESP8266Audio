@@ -1,7 +1,7 @@
 /*
   AudioFileSourceHTTPStream
   Connect to a HTTP based streaming service
-  
+
   Copyright (C) 2017  Earle F. Philhower, III
 
   This program is free software: you can redistribute it and/or modify
@@ -21,6 +21,8 @@
 #if defined(ESP32) || defined(ESP8266)
 #pragma once
 
+#include <map> // std::map<char, int> ascii_to_hex;
+
 #include <Arduino.h>
 #ifdef ESP32
   #include <HTTPClient.h>
@@ -28,6 +30,7 @@
   #include <ESP8266HTTPClient.h>
 #endif
 #include "AudioFileSource.h"
+#include "WiFiClientSecure.h"
 
 class AudioFileSourceHTTPStream : public AudioFileSource
 {
@@ -37,7 +40,7 @@ class AudioFileSourceHTTPStream : public AudioFileSource
     AudioFileSourceHTTPStream();
     AudioFileSourceHTTPStream(const char *url);
     virtual ~AudioFileSourceHTTPStream() override;
-    
+
     virtual bool open(const char *url) override;
     virtual uint32_t read(void *data, uint32_t len) override;
     virtual uint32_t readNonBlock(void *data, uint32_t len) override;
@@ -52,14 +55,27 @@ class AudioFileSourceHTTPStream : public AudioFileSource
     enum { STATUS_HTTPFAIL=2, STATUS_DISCONNECTED, STATUS_RECONNECTING, STATUS_RECONNECTED, STATUS_NODATA };
 
   private:
-    virtual uint32_t readInternal(void *data, uint32_t len, bool nonBlock);
-    WiFiClient client;
+    bool is_chunked;
+    int next_chunk;
+    bool eof;
+    WiFiClient __client;
+    WiFiClientSecure __client_ssl;
+    WiFiClient *_client = nullptr;
     HTTPClient http;
     int pos;
     int size;
     int reconnectTries;
     int reconnectDelayMs;
     char saveURL[128];
+    uint32_t (AudioFileSourceHTTPStream::*readImpl)(void *data, uint32_t len, bool nonBlock);
+
+    void _setup_client(const char *url);
+    virtual uint32_t readInternal(void *data, uint32_t len, bool nonBlock);
+    uint32_t readChunked(void *data, uint32_t len, bool nonBlock);
+    uint32_t readRegular(void *data, uint32_t len, bool nonBlock);
+    bool verifyCrlf();
+    int getChunkSize();
+
 };
 
 
