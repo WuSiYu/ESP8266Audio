@@ -24,12 +24,60 @@ AudioFileSourceHTTPStream::AudioFileSourceHTTPStream() {
     pos = 0;
     reconnectTries = 0;
     saveURL[0] = 0;
+    next_chunk = 0;
+    eof = false;
 }
 
 AudioFileSourceHTTPStream::AudioFileSourceHTTPStream(const char *url) {
     saveURL[0] = 0;
     reconnectTries = 0;
+    next_chunk = 0;
     open(url);
+}
+
+bool AudioFileSourceHTTPStream::verifyCrlf()
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    NetworkClient *stream = http.getStreamPtr();
+#else
+    WiFiClient *stream = http.getStreamPtr();
+#endif
+    if (!stream) return false;
+
+    uint8_t crlf[3];
+    stream->read(crlf, 2);
+    crlf[2] = 0;
+
+    return !strncmp("\r\n", reinterpret_cast<const char*>(crlf), 2);
+}
+
+int AudioFileSourceHTTPStream::getChunkSize()
+{
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    NetworkClient *stream = http.getStreamPtr();
+#else
+    WiFiClient *stream = http.getStreamPtr();
+#endif
+    if (!stream) return -1;
+
+    unsigned long start = millis();
+    while ((stream->available() == 0) && (((signed long)(millis() - start)) < 1500)){
+        yield();
+    }
+    if (stream->available() == 0) return -1;
+    String length = stream->readStringUntil('\r');
+    String lf = stream->readStringUntil('\n');
+
+    unsigned int val = 0;
+    auto ret = sscanf(length.c_str(), "%x", &val);
+    if(ret)
+    {
+        return val;
+    }
+    else
+    {
+        return -1;
+    }
 }
 
 bool AudioFileSourceHTTPStream::open(const char *url) {
@@ -39,12 +87,35 @@ bool AudioFileSourceHTTPStream::open(const char *url) {
 #ifndef ESP32
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 #endif
+    const char* headers[] = { "Transfer-Encoding" };
+    http.collectHeaders( headers, 1 );
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
         http.end();
         cb.st(STATUS_HTTPFAIL, PSTR("Can't open HTTP request"));
         return false;
     }
+
+    if (http.hasHeader("Transfer-Encoding")) {
+        audioLogger->printf_P(PSTR("Transfer-Encoding: %s\n"), http.header("Transfer-Encoding").c_str());
+        if(http.header("Transfer-Encoding") == String(PSTR("chunked"))) {
+            next_chunk = getChunkSize();
+            if(-1 == next_chunk)
+            {
+                return false;
+            }
+            is_chunked = true;
+            readImpl = &AudioFileSourceHTTPStream::readChunked;
+        } else {
+            is_chunked = false;
+            readImpl = &AudioFileSourceHTTPStream::readRegular;
+        }
+    } else {
+        readImpl = &AudioFileSourceHTTPStream::readRegular;
+        audioLogger->printf_P(PSTR("No Transfer-Encoding\n"));
+        is_chunked = false;
+    }
+
     size = http.getSize();
     strncpy(saveURL, url, sizeof(saveURL));
     saveURL[sizeof(saveURL) - 1] = 0;
@@ -55,12 +126,57 @@ AudioFileSourceHTTPStream::~AudioFileSourceHTTPStream() {
     http.end();
 }
 
+uint32_t AudioFileSourceHTTPStream::readRegular(void *data, uint32_t len, bool nonBlock)
+{
+  return readInternal(data, len, nonBlock);
+}
+
+uint32_t AudioFileSourceHTTPStream::readChunked(void *data, uint32_t len, bool nonBlock)
+{
+  uint32_t bytesRead = 0;
+  uint32_t pos = 0;
+
+  if(len > 0)
+  {
+    if(len >= next_chunk)
+    {
+      if (next_chunk)
+      {
+        bytesRead = readInternal((void*)(((uint8_t*)data) + pos), next_chunk, nonBlock);
+        next_chunk -= bytesRead;
+        pos += bytesRead;
+      }
+      len -= pos;
+      if (!next_chunk){
+        if(!verifyCrlf())
+        {
+          audioLogger->printf(PSTR("Couldn't read CRLF after chunk, something is wrong !!\n"));
+          return 0;
+        }
+        next_chunk = getChunkSize();
+        if (next_chunk < 0){
+          //timeout EOF
+          close();
+        }
+      }
+    }
+    else
+    {
+      bytesRead = readInternal((void*)(((uint8_t*)data) + pos), len, nonBlock);
+      next_chunk -= bytesRead;
+      len -= bytesRead;
+      pos += bytesRead;
+    }
+  }
+  return pos;
+}
+
 uint32_t AudioFileSourceHTTPStream::read(void *data, uint32_t len) {
     if (data == NULL) {
         audioLogger->printf_P(PSTR("ERROR! AudioFileSourceHTTPStream::read passed NULL data\n"));
         return 0;
     }
-    return readInternal(data, len, false);
+    return (this->*readImpl)(data, len, false);
 }
 
 uint32_t AudioFileSourceHTTPStream::readNonBlock(void *data, uint32_t len) {
@@ -68,7 +184,7 @@ uint32_t AudioFileSourceHTTPStream::readNonBlock(void *data, uint32_t len) {
         audioLogger->printf_P(PSTR("ERROR! AudioFileSourceHTTPStream::readNonBlock passed NULL data\n"));
         return 0;
     }
-    return readInternal(data, len, true);
+    return (this->*readImpl)(data, len, true);
 }
 
 uint32_t AudioFileSourceHTTPStream::readInternal(void *data, uint32_t len, bool nonBlock) {
@@ -116,7 +232,7 @@ retry:
     size_t avail = stream->available();
     if (!nonBlock && !avail) {
         cb.st(STATUS_NODATA, PSTR("No stream data available"));
-        http.end();
+        close();
         goto retry;
     }
     if (avail == 0) {
@@ -140,11 +256,12 @@ bool AudioFileSourceHTTPStream::seek(int32_t pos, int dir) {
 
 bool AudioFileSourceHTTPStream::close() {
     http.end();
+    eof = true;
     return true;
 }
 
 bool AudioFileSourceHTTPStream::isOpen() {
-    return http.connected();
+    return http.connected() && (!eof);
 }
 
 uint32_t AudioFileSourceHTTPStream::getSize() {

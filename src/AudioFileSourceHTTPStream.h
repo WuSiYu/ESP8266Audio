@@ -56,6 +56,16 @@ public:
     enum { STATUS_HTTPFAIL = 2, STATUS_DISCONNECTED, STATUS_RECONNECTING, STATUS_RECONNECTED, STATUS_NODATA };
 
 private:
+    bool is_chunked;
+    int next_chunk;
+    bool eof;
+    uint32_t (AudioFileSourceHTTPStream::*readImpl)(void *data, uint32_t len, bool nonBlock);
+
+    uint32_t readChunked(void *data, uint32_t len, bool nonBlock);
+    uint32_t readRegular(void *data, uint32_t len, bool nonBlock);
+    bool verifyCrlf();
+    int getChunkSize();
+
     virtual uint32_t readInternal(void *data, uint32_t len, bool nonBlock);
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
     NetworkClient client;
