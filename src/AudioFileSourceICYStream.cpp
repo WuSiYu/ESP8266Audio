@@ -40,7 +40,16 @@ AudioFileSourceICYStream::AudioFileSourceICYStream(const char *url) {
 bool AudioFileSourceICYStream::open(const char *url) {
     static const char *hdr[] = { "icy-metaint", "icy-name", "icy-genre", "icy-br", "Transfer-Encoding" };
     pos = 0;
+#if defined(CONFIG_ESP_TLS_USING_MBEDTLS) || defined(CONFIG_ESP_TLS_USING_WOLFSSL)
+    if (url[4] == 's') {
+        client_ssl.setInsecure(); // No validation
+        http.begin(client_ssl, url);
+    } else {
+      http.begin(client, url);
+    }
+#else
     http.begin(client, url);
+#endif
     http.addHeader("Icy-MetaData", "1");
     http.collectHeaders(hdr, 5);
     http.setReuse(true);

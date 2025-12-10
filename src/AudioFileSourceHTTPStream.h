@@ -69,8 +69,14 @@ private:
     virtual uint32_t readInternal(void *data, uint32_t len, bool nonBlock);
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
     NetworkClient client;
+#if defined(CONFIG_ESP_TLS_USING_MBEDTLS) || defined(CONFIG_ESP_TLS_USING_WOLFSSL)
+    NetworkClientSecure client_ssl;
+#endif
 #else
     WiFiClient client;
+#if defined(CONFIG_ESP_TLS_USING_MBEDTLS) || defined(CONFIG_ESP_TLS_USING_WOLFSSL)
+    WiFiClientSecure client_ssl;
+#endif
 #endif
     HTTPClient http;
     int pos;

@@ -82,7 +82,16 @@ int AudioFileSourceHTTPStream::getChunkSize()
 
 bool AudioFileSourceHTTPStream::open(const char *url) {
     pos = 0;
+#if defined(CONFIG_ESP_TLS_USING_MBEDTLS) || defined(CONFIG_ESP_TLS_USING_WOLFSSL)
+    if (url[4] == 's') {
+        client_ssl.setInsecure(); // No validation
+        http.begin(client_ssl, url);
+    } else {
+      http.begin(client, url);
+    }
+#else
     http.begin(client, url);
+#endif
     http.setReuse(true);
 #ifndef ESP32
     http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
