@@ -69,6 +69,7 @@ protected:
     int lastBuffLen;
     unsigned int lastRate;
     int lastChannels;
+    int lastBitrate;
 
     // Decoding bits
     bool madInitted;

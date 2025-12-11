@@ -199,6 +199,12 @@ bool AudioGeneratorMP3::DecodeNextFrame() {
         return false;
     }
     nsCountMax  = MAD_NSBSAMPLES(&frame->header);
+    if (frame->header.bitrate != lastBitrate) {
+        lastBitrate = frame->header.bitrate;
+        char buff[10];
+        snprintf(buff, sizeof(buff), "%d", lastBitrate);
+        cb.md("BITRATE", false, buff);
+    }
     return true;
 }
 
@@ -321,6 +327,7 @@ bool AudioGeneratorMP3::begin(AudioFileSource *source, AudioOutput *output) {
     nsCount = 9999;
     lastRate = 0;
     lastChannels = 0;
+    lastBitrate = 0;
     lastReadPos = 0;
     lastBuffLen = 0;
 
